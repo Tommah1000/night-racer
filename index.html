@@ -1,0 +1,660 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🏎️ Night Racer</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            overflow: hidden;
+            font-family: 'Courier New', monospace;
+            background: #000;
+            touch-action: none;
+        }
+        
+        #gameCanvas {
+            display: block;
+            width: 100vw;
+            height: 100vh;
+            image-rendering: pixelated;
+        }
+        
+        #touchControls {
+            display: none;
+            position: fixed;
+            bottom: 20px;
+            left: 0;
+            right: 0;
+            z-index: 100;
+            pointer-events: none;
+        }
+        
+        #touchControls.visible {
+            display: flex;
+            justify-content: space-between;
+            padding: 0 20px;
+        }
+        
+        .touch-button {
+            pointer-events: all;
+            background: rgba(255, 255, 255, 0.1);
+            border: 2px solid rgba(255, 255, 255, 0.3);
+            border-radius: 50%;
+            width: 70px;
+            height: 70px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 24px;
+            color: white;
+            user-select: none;
+            touch-action: manipulation;
+            backdrop-filter: blur(10px);
+        }
+        
+        .touch-button:active {
+            background: rgba(255, 255, 255, 0.3);
+        }
+        
+        .touch-group {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+        
+        .touch-lr {
+            display: flex;
+            gap: 10px;
+        }
+        
+        .touch-ud {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="gameCanvas"></canvas>
+    
+    <div id="touchControls">
+        <div class="touch-group">
+            <div class="touch-lr">
+                <div class="touch-button" id="btnLeft">←</div>
+                <div class="touch-button" id="btnRight">→</div>
+            </div>
+        </div>
+        <div class="touch-group">
+            <div class="touch-ud">
+                <div class="touch-button" id="btnAccel">↑</div>
+                <div class="touch-button" id="btnBrake">↓</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        
+        // Resize canvas to full window
+        function resizeCanvas() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+        }
+        resizeCanvas();
+        window.addEventListener('resize', resizeCanvas);
+        
+        // Touch detection
+        const isTouchDevice = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
+        if (isTouchDevice) {
+            document.getElementById('touchControls').classList.add('visible');
+        }
+        
+        // Game constants
+        const ROAD_WIDTH = 2000;
+        const SEGMENT_LENGTH = 200;
+        const CAMERA_HEIGHT = 1500;
+        const DRAW_DISTANCE = 300;
+        const FOV = 100;
+        
+        // Game state
+        let gameState = 'start'; // start, playing, gameover
+        let keys = {};
+        let touchKeys = {};
+        let speed = 0;
+        let playerX = 0; // -1 to 1, center of road
+        let position = 0; // position along track
+        let cameraDepth = 1 / CAMERA_HEIGHT;
+        let lives = 3;
+        let distance = 0;
+        let highScore = parseInt(localStorage.getItem('nightRacerHighScore')) || 0;
+        
+        // Crash state
+        let crashShake = 0;
+        let crashSlowdown = 0;
+        
+        // Audio context
+        let audioCtx = null;
+        let engineOsc = null;
+        let engineGain = null;
+        
+        function initAudio() {
+            if (audioCtx) return;
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            
+            // Engine sound
+            engineOsc = audioCtx.createOscillator();
+            engineOsc.type = 'sawtooth';
+            engineOsc.frequency.value = 80;
+            
+            engineGain = audioCtx.createGain();
+            engineGain.gain.value = 0.05;
+            
+            engineOsc.connect(engineGain);
+            engineGain.connect(audioCtx.destination);
+            engineOsc.start();
+        }
+        
+        function playCrashSound() {
+            if (!audioCtx) return;
+            const noise = audioCtx.createBufferSource();
+            const buffer = audioCtx.createBuffer(1, audioCtx.sampleRate * 0.2, audioCtx.sampleRate);
+            const data = buffer.getChannelData(0);
+            for (let i = 0; i < data.length; i++) {
+                data[i] = Math.random() * 2 - 1;
+            }
+            noise.buffer = buffer;
+            
+            const crashGain = audioCtx.createGain();
+            crashGain.gain.value = 0.1;
+            crashGain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.2);
+            
+            noise.connect(crashGain);
+            crashGain.connect(audioCtx.destination);
+            noise.start();
+        }
+        
+        // Road generation
+        function generateRoadSegments() {
+            const segments = [];
+            let curve = 0;
+            let curveChange = 0;
+            
+            for (let i = 0; i < 1000; i++) {
+                const segment = {
+                    index: i,
+                    p1: { world: { z: i * SEGMENT_LENGTH }, camera: {}, screen: {} },
+                    p2: { world: { z: (i + 1) * SEGMENT_LENGTH }, camera: {}, screen: {} },
+                    curve: curve,
+                    color: i % 10 === 0 ? '#555' : '#444',
+                    hasStreetLight: i % 8 === 0
+                };
+                
+                segments.push(segment);
+                
+                // Generate curves
+                if (i % 50 === 0) {
+                    curveChange = (Math.random() - 0.5) * 0.002;
+                }
+                curve += curveChange;
+                
+                // Dampen curves
+                if (Math.abs(curve) > 0.05) {
+                    curveChange = -Math.sign(curve) * 0.001;
+                }
+            }
+            
+            return segments;
+        }
+        
+        const roadSegments = generateRoadSegments();
+        
+        // Traffic cars
+        const trafficCars = [];
+        function spawnTraffic() {
+            if (trafficCars.length < 5 && Math.random() < 0.02) {
+                const segment = Math.floor(position / SEGMENT_LENGTH) + 20 + Math.floor(Math.random() * 50);
+                trafficCars.push({
+                    segment: segment,
+                    x: (Math.random() - 0.5) * 0.8, // -0.4 to 0.4
+                    speed: 0.3 + Math.random() * 0.3,
+                    z: segment * SEGMENT_LENGTH
+                });
+            }
+        }
+        
+        // Input handling
+        window.addEventListener('keydown', (e) => {
+            keys[e.key] = true;
+            if (gameState === 'start' && e.key === 'Enter') {
+                startGame();
+            }
+            if (gameState === 'gameover' && e.key === 'Enter') {
+                resetGame();
+            }
+        });
+        
+        window.addEventListener('keyup', (e) => {
+            keys[e.key] = false;
+        });
+        
+        // Touch controls
+        function setupTouchButton(id, key) {
+            const btn = document.getElementById(id);
+            btn.addEventListener('touchstart', (e) => {
+                e.preventDefault();
+                touchKeys[key] = true;
+            });
+            btn.addEventListener('touchend', (e) => {
+                e.preventDefault();
+                touchKeys[key] = false;
+            });
+        }
+        
+        setupTouchButton('btnLeft', 'ArrowLeft');
+        setupTouchButton('btnRight', 'ArrowRight');
+        setupTouchButton('btnAccel', 'ArrowUp');
+        setupTouchButton('btnBrake', 'ArrowDown');
+        
+        function isKeyPressed(key) {
+            return keys[key] || touchKeys[key];
+        }
+        
+        function startGame() {
+            gameState = 'playing';
+            initAudio();
+        }
+        
+        function resetGame() {
+            gameState = 'start';
+            speed = 0;
+            playerX = 0;
+            position = 0;
+            lives = 3;
+            distance = 0;
+            trafficCars.length = 0;
+            crashShake = 0;
+            crashSlowdown = 0;
+        }
+        
+        // Projection
+        function project(p, cameraX, cameraZ) {
+            const transX = p.world.x - cameraX;
+            const transZ = p.world.z - cameraZ;
+            
+            p.camera.x = transX;
+            p.camera.z = transZ;
+            
+            p.screen.scale = cameraDepth / transZ;
+            p.screen.x = Math.round(canvas.width / 2 + (p.screen.scale * transX * canvas.width / 2));
+            p.screen.y = Math.round(canvas.height / 2 - (p.screen.scale * CAMERA_HEIGHT * canvas.height / 2));
+            p.screen.w = Math.round(p.screen.scale * ROAD_WIDTH * canvas.width / 2);
+        }
+        
+        // Update
+        function update(dt) {
+            if (gameState !== 'playing') return;
+            
+            // Crash effects
+            if (crashShake > 0) crashShake -= dt * 10;
+            if (crashSlowdown > 0) crashSlowdown -= dt * 2;
+            
+            // Controls
+            const accel = isKeyPressed('ArrowUp') || isKeyPressed('w');
+            const brake = isKeyPressed('ArrowDown') || isKeyPressed('s');
+            const left = isKeyPressed('ArrowLeft') || isKeyPressed('a');
+            const right = isKeyPressed('ArrowRight') || isKeyPressed('d');
+            
+            // Speed
+            const maxSpeed = 8000;
+            const acceleration = 1000;
+            const braking = 2000;
+            const deceleration = 500;
+            
+            if (accel && speed < maxSpeed) {
+                speed += acceleration * dt * (1 - crashSlowdown);
+            } else if (brake) {
+                speed = Math.max(0, speed - braking * dt);
+            } else {
+                speed = Math.max(0, speed - deceleration * dt);
+            }
+            
+            // Steering
+            const steerSpeed = 2.5;
+            if (left) playerX -= steerSpeed * dt * (speed / maxSpeed);
+            if (right) playerX += steerSpeed * dt * (speed / maxSpeed);
+            
+            // Apply curve to player position
+            const playerSegmentIndex = Math.floor(position / SEGMENT_LENGTH);
+            const playerSegment = roadSegments[playerSegmentIndex % roadSegments.length];
+            if (playerSegment) {
+                playerX += playerSegment.curve * speed * dt * 0.5;
+            }
+            
+            // Clamp player to road edges (with some offroad tolerance)
+            playerX = Math.max(-1.2, Math.min(1.2, playerX));
+            
+            // Move forward
+            position += speed * dt;
+            distance = Math.floor(position / 100);
+            
+            // Update audio
+            if (engineOsc) {
+                engineOsc.frequency.value = 80 + (speed / maxSpeed) * 200;
+                engineGain.gain.value = speed > 0 ? 0.05 : 0;
+            }
+            
+            // Spawn and update traffic
+            spawnTraffic();
+            trafficCars.forEach((car, idx) => {
+                car.z += car.speed * 100 * dt;
+                
+                // Collision detection
+                const carSegmentIndex = Math.floor(car.z / SEGMENT_LENGTH);
+                if (Math.abs(carSegmentIndex - playerSegmentIndex) < 2) {
+                    const dist = Math.abs(car.x - playerX);
+                    if (dist < 0.2) {
+                        handleCrash();
+                        trafficCars.splice(idx, 1);
+                    }
+                }
+                
+                // Remove cars behind player
+                if (car.z < position - SEGMENT_LENGTH * 10) {
+                    trafficCars.splice(idx, 1);
+                }
+            });
+            
+            // Check if offroad (crashed into edge)
+            if (Math.abs(playerX) > 1.0 && speed > 2000) {
+                if (Math.random() < 0.1) {
+                    handleCrash();
+                }
+            }
+        }
+        
+        function handleCrash() {
+            lives--;
+            crashShake = 1;
+            crashSlowdown = 0.8;
+            speed *= 0.5;
+            playCrashSound();
+            
+            if (lives <= 0) {
+                gameState = 'gameover';
+                if (distance > highScore) {
+                    highScore = distance;
+                    localStorage.setItem('nightRacerHighScore', highScore);
+                }
+            }
+        }
+        
+        // Render
+        function render() {
+            const shakeX = crashShake > 0 ? (Math.random() - 0.5) * crashShake * 20 : 0;
+            const shakeY = crashShake > 0 ? (Math.random() - 0.5) * crashShake * 20 : 0;
+            
+            ctx.save();
+            ctx.translate(shakeX, shakeY);
+            
+            // Sky gradient
+            const skyGradient = ctx.createLinearGradient(0, 0, 0, canvas.height * 0.6);
+            skyGradient.addColorStop(0, '#0a0a1a');
+            skyGradient.addColorStop(1, '#1a1a3a');
+            ctx.fillStyle = skyGradient;
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            
+            // Stars
+            for (let i = 0; i < 50; i++) {
+                const x = (i * 7919) % canvas.width;
+                const y = (i * 3571) % (canvas.height * 0.4);
+                ctx.fillStyle = 'rgba(255, 255, 255, 0.6)';
+                ctx.fillRect(x, y, 2, 2);
+            }
+            
+            // City silhouette
+            ctx.fillStyle = 'rgba(10, 10, 30, 0.8)';
+            for (let i = 0; i < 20; i++) {
+                const x = i * canvas.width / 20;
+                const h = 50 + Math.sin(i * 0.7) * 30;
+                ctx.fillRect(x, canvas.height * 0.4 - h, canvas.width / 20, h);
+            }
+            
+            // Road rendering
+            const baseSegment = Math.floor(position / SEGMENT_LENGTH);
+            const basePercent = (position % SEGMENT_LENGTH) / SEGMENT_LENGTH;
+            
+            let cameraX = playerX * ROAD_WIDTH / 2;
+            let cameraZ = position;
+            
+            let maxy = canvas.height;
+            
+            for (let n = baseSegment; n < baseSegment + DRAW_DISTANCE; n++) {
+                const segment = roadSegments[n % roadSegments.length];
+                
+                // World coordinates
+                segment.p1.world.x = segment.curve * (n - baseSegment) * SEGMENT_LENGTH;
+                segment.p2.world.x = segment.curve * (n + 1 - baseSegment) * SEGMENT_LENGTH;
+                
+                project(segment.p1, cameraX, cameraZ);
+                project(segment.p2, cameraX, cameraZ);
+                
+                if (segment.p1.camera.z <= cameraDepth || segment.p2.camera.z <= cameraDepth) continue;
+                if (segment.p2.screen.y >= maxy) continue;
+                
+                // Draw road segment
+                ctx.fillStyle = segment.color;
+                
+                const p1 = segment.p1.screen;
+                const p2 = segment.p2.screen;
+                
+                ctx.beginPath();
+                ctx.moveTo(p1.x - p1.w, p1.y);
+                ctx.lineTo(p1.x + p1.w, p1.y);
+                ctx.lineTo(p2.x + p2.w, p2.y);
+                ctx.lineTo(p2.x - p2.w, p2.y);
+                ctx.closePath();
+                ctx.fill();
+                
+                // Road markings
+                const markWidth = p2.w * 0.05;
+                ctx.fillStyle = 'white';
+                
+                // Center line (dashed)
+                if (n % 2 === 0) {
+                    ctx.fillRect(p2.x - markWidth / 2, p2.y, markWidth, p2.y - p1.y);
+                }
+                
+                // Edge markers (red/white kerbs)
+                if (n % 2 === 0) {
+                    ctx.fillStyle = '#ff0000';
+                } else {
+                    ctx.fillStyle = 'white';
+                }
+                ctx.fillRect(p2.x - p2.w - markWidth * 2, p2.y, markWidth * 2, p2.y - p1.y);
+                ctx.fillRect(p2.x + p2.w, p2.y, markWidth * 2, p2.y - p1.y);
+                
+                // Streetlights
+                if (segment.hasStreetLight && n % 16 === 0) {
+                    const lightX = p2.x + p2.w + p2.w * 0.3;
+                    const lightY = p2.y;
+                    const lightScale = p2.screen.scale;
+                    
+                    if (lightScale > 0.01) {
+                        // Pole
+                        ctx.fillStyle = '#333';
+                        ctx.fillRect(lightX, lightY, 4 * lightScale * 100, -100 * lightScale * 100);
+                        
+                        // Light glow
+                        const gradient = ctx.createRadialGradient(lightX, lightY - 80 * lightScale * 100, 0, lightX, lightY - 80 * lightScale * 100, 60 * lightScale * 100);
+                        gradient.addColorStop(0, 'rgba(255, 220, 150, 0.4)');
+                        gradient.addColorStop(1, 'rgba(255, 220, 150, 0)');
+                        ctx.fillStyle = gradient;
+                        ctx.fillRect(lightX - 60 * lightScale * 100, lightY - 140 * lightScale * 100, 120 * lightScale * 100, 120 * lightScale * 100);
+                    }
+                }
+                
+                maxy = p2.y;
+            }
+            
+            // Traffic cars
+            trafficCars.forEach(car => {
+                const carSegmentIndex = Math.floor(car.z / SEGMENT_LENGTH);
+                const segment = roadSegments[carSegmentIndex % roadSegments.length];
+                if (!segment) return;
+                
+                const carPoint = {
+                    world: { x: car.x * ROAD_WIDTH / 2, z: car.z },
+                    camera: {},
+                    screen: {}
+                };
+                
+                project(carPoint, cameraX, cameraZ);
+                
+                if (carPoint.camera.z > cameraDepth && carPoint.screen.y < canvas.height) {
+                    const carWidth = 80 * carPoint.screen.scale * 100;
+                    const carHeight = 120 * carPoint.screen.scale * 100;
+                    
+                    // Car body
+                    ctx.fillStyle = '#e63946';
+                    ctx.fillRect(carPoint.screen.x - carWidth / 2, carPoint.screen.y - carHeight, carWidth, carHeight);
+                    
+                    // Car windows
+                    ctx.fillStyle = '#457b9d';
+                    ctx.fillRect(carPoint.screen.x - carWidth * 0.4, carPoint.screen.y - carHeight * 0.8, carWidth * 0.8, carHeight * 0.3);
+                    
+                    // Tail lights
+                    ctx.fillStyle = '#ff0000';
+                    ctx.fillRect(carPoint.screen.x - carWidth * 0.4, carPoint.screen.y - carHeight * 0.1, carWidth * 0.15, carHeight * 0.1);
+                    ctx.fillRect(carPoint.screen.x + carWidth * 0.25, carPoint.screen.y - carHeight * 0.1, carWidth * 0.15, carHeight * 0.1);
+                }
+            });
+            
+            // Player car
+            const playerCarWidth = 100;
+            const playerCarHeight = 150;
+            const playerCarY = canvas.height - playerCarHeight - 50;
+            const playerCarX = canvas.width / 2 + (playerX * canvas.width * 0.3);
+            
+            // Headlight effect
+            const headlightGradient = ctx.createLinearGradient(playerCarX, playerCarY, playerCarX, 0);
+            headlightGradient.addColorStop(0, 'rgba(255, 255, 200, 0.1)');
+            headlightGradient.addColorStop(1, 'rgba(255, 255, 200, 0)');
+            ctx.fillStyle = headlightGradient;
+            ctx.beginPath();
+            ctx.moveTo(playerCarX, playerCarY);
+            ctx.lineTo(playerCarX - 150, 0);
+            ctx.lineTo(playerCarX + 150, 0);
+            ctx.closePath();
+            ctx.fill();
+            
+            // Car body
+            ctx.fillStyle = '#00b4d8';
+            ctx.fillRect(playerCarX - playerCarWidth / 2, playerCarY, playerCarWidth, playerCarHeight);
+            
+            // Car top
+            ctx.fillStyle = '#0096c7';
+            ctx.fillRect(playerCarX - playerCarWidth * 0.4, playerCarY + 20, playerCarWidth * 0.8, playerCarHeight * 0.4);
+            
+            // Windshield
+            ctx.fillStyle = 'rgba(100, 150, 200, 0.5)';
+            ctx.fillRect(playerCarX - playerCarWidth * 0.3, playerCarY + 30, playerCarWidth * 0.6, playerCarHeight * 0.2);
+            
+            // Headlights
+            ctx.fillStyle = '#ffff00';
+            ctx.fillRect(playerCarX - playerCarWidth * 0.4, playerCarY + playerCarHeight - 10, 15, 8);
+            ctx.fillRect(playerCarX + playerCarWidth * 0.4 - 15, playerCarY + playerCarHeight - 10, 15, 8);
+            
+            ctx.restore();
+            
+            // HUD
+            ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
+            ctx.fillRect(10, 10, 250, 140);
+            
+            ctx.font = 'bold 48px "Courier New"';
+            ctx.fillStyle = '#00ff00';
+            ctx.fillText(Math.floor(speed / 10) + ' km/h', 20, 60);
+            
+            ctx.font = '20px "Courier New"';
+            ctx.fillStyle = 'white';
+            ctx.fillText('Distance: ' + distance + ' m', 20, 90);
+            
+            // Lives (hearts)
+            ctx.fillText('Lives: ', 20, 115);
+            for (let i = 0; i < lives; i++) {
+                ctx.fillStyle = '#ff0000';
+                ctx.fillText('♥', 90 + i * 25, 115);
+            }
+            
+            ctx.fillStyle = 'white';
+            ctx.fillText('High: ' + highScore + ' m', 20, 140);
+            
+            // Game states
+            if (gameState === 'start') {
+                ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                
+                ctx.font = 'bold 72px "Courier New"';
+                ctx.fillStyle = '#00d4ff';
+                ctx.textAlign = 'center';
+                ctx.fillText('NIGHT RACER', canvas.width / 2, canvas.height / 2 - 50);
+                
+                ctx.font = '24px "Courier New"';
+                ctx.fillStyle = 'white';
+                ctx.fillText('Press ENTER to Start', canvas.width / 2, canvas.height / 2 + 20);
+                
+                ctx.font = '18px "Courier New"';
+                ctx.fillText('Arrow Keys or WASD to Drive', canvas.width / 2, canvas.height / 2 + 60);
+                ctx.fillText('Dodge Traffic • Don\'t Crash • 3 Lives', canvas.width / 2, canvas.height / 2 + 90);
+                
+                ctx.textAlign = 'left';
+            }
+            
+            if (gameState === 'gameover') {
+                ctx.fillStyle = 'rgba(0, 0, 0, 0.8)';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                
+                ctx.font = 'bold 64px "Courier New"';
+                ctx.fillStyle = '#ff0000';
+                ctx.textAlign = 'center';
+                ctx.fillText('GAME OVER', canvas.width / 2, canvas.height / 2 - 50);
+                
+                ctx.font = '32px "Courier New"';
+                ctx.fillStyle = 'white';
+                ctx.fillText('Distance: ' + distance + ' m', canvas.width / 2, canvas.height / 2 + 20);
+                
+                if (distance === highScore && distance > 0) {
+                    ctx.fillStyle = '#00ff00';
+                    ctx.fillText('NEW HIGH SCORE!', canvas.width / 2, canvas.height / 2 + 60);
+                }
+                
+                ctx.fillStyle = 'white';
+                ctx.font = '24px "Courier New"';
+                ctx.fillText('Press ENTER to Retry', canvas.width / 2, canvas.height / 2 + 110);
+                
+                ctx.textAlign = 'left';
+            }
+        }
+        
+        // Game loop
+        let lastTime = 0;
+        function gameLoop(currentTime) {
+            const dt = Math.min((currentTime - lastTime) / 1000, 0.1);
+            lastTime = currentTime;
+            
+            update(dt);
+            render();
+            
+            requestAnimationFrame(gameLoop);
+        }
+        
+        requestAnimationFrame(gameLoop);
+    </script>
+</body>
+</html>
